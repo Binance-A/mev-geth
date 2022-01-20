@@ -253,13 +253,14 @@ type TxPool struct {
 	locals  *accountSet // Set of local transaction to exempt from eviction rules
 	journal *txJournal  // Journal of local transaction to back up to disk
 
-	pending     map[common.Address]*txList   // All currently processable transactions
-	queue       map[common.Address]*txList   // Queued but non-processable transactions
-	beats       map[common.Address]time.Time // Last heartbeat from each known account
-	mevBundles  []types.MevBundle
-	megabundles map[common.Address]types.MevBundle // One megabundle per each trusted relay
-	all         *txLookup                          // All transactions to allow lookups
-	priced      *txPricedList                      // All transactions sorted by price
+	pending            map[common.Address]*txList   // All currently processable transactions
+	queue              map[common.Address]*txList   // Queued but non-processable transactions
+	beats              map[common.Address]time.Time // Last heartbeat from each known account
+	mevBundles         []types.MevBundle
+	megabundles        map[common.Address]types.MevBundle // One megabundle per each trusted relay
+	NewMegabundleHooks []func()
+	all                *txLookup     // All transactions to allow lookups
+	priced             *txPricedList // All transactions sorted by price
 
 	chainHeadCh     chan ChainHeadEvent
 	chainHeadSub    event.Subscription
@@ -637,6 +638,11 @@ func (pool *TxPool) AddMegabundle(relayAddr common.Address, txs types.Transactio
 		MaxTimestamp:      maxTimestamp,
 		RevertingTxHashes: revertingTxHashes,
 	}
+
+	for hook := range pool.NewMegabundleHooks {
+		go pool.NewMegabundleHooks[hook]()
+	}
+
 	return nil
 }
 

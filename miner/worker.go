@@ -111,6 +111,7 @@ type task struct {
 const (
 	commitInterruptNone int32 = iota
 	commitInterruptNewHead
+	commitInterruptNewMegabundle
 	commitInterruptResubmit
 )
 
@@ -155,6 +156,7 @@ type worker struct {
 	resultCh           chan *types.Block
 	startCh            chan struct{}
 	exitCh             chan struct{}
+	newMegabundleCh    chan bool
 	resubmitIntervalCh chan time.Duration
 	resubmitAdjustCh   chan *intervalAdjust
 
@@ -245,10 +247,21 @@ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus
 		resultCh:           make(chan *types.Block, resultQueueSize),
 		exitCh:             exitCh,
 		startCh:            make(chan struct{}, 1),
+		newMegabundleCh:    make(chan bool),
 		resubmitIntervalCh: make(chan time.Duration),
 		resubmitAdjustCh:   make(chan *intervalAdjust, resubmitAdjustChanSize),
 		flashbots:          flashbots,
 	}
+
+	if flashbots.isMegabundleWorker {
+		eth.TxPool().NewMegabundleHooks = append(eth.TxPool().NewMegabundleHooks, func() {
+			select {
+			case worker.newMegabundleCh <- true:
+			default:
+			}
+		})
+	}
+
 	// Subscribe NewTxsEvent for tx pool
 	worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh)
 	// Subscribe events for blockchain
@@ -436,6 +449,11 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 			clearPending(head.Block.NumberU64())
 			timestamp = time.Now().Unix()
 			commit(false, commitInterruptNewHead)
+
+		case <-w.newMegabundleCh:
+			if w.isRunning() {
+				commit(true, commitInterruptNewMegabundle)
+			}
 
 		case <-timer.C:
 			// If mining is running resubmit a new work cycle periodically to pull in
@@ -761,10 +779,10 @@ func (w *worker) generateEnv(parent *types.Block, header *types.Header) (*enviro
 // makeCurrent creates a new environment for the current cycle.
 func (w *worker) makeCurrent(parent *types.Block, header *types.Header) error {
 	env, err := w.generateEnv(parent, header)
-	env.state.StartPrefetcher("miner")
 	if err != nil {
 		return err
 	}
+	env.state.StartPrefetcher("miner")
 
 	// Swap out the old work with the new one, terminating any leftover prefetcher
 	// processes in the mean time and starting a new one.
@@ -881,8 +899,9 @@ func (w *worker) commitBundle(txs types.Transactions, coinbase common.Address, i
 					ratio: ratio,
 					inc:   true,
 				}
+				return false
 			}
-			return atomic.LoadInt32(interrupt) == commitInterruptNewHead
+			return true
 		}
 		// If we don't have enough gas for any further transactions then we're done
 		if w.current.gasPool.Gas() < params.TxGas {
@@ -994,8 +1013,9 @@ func (w *worker) commitTransactions(txs *types.TransactionsByPriceAndNonce, coin
 					ratio: ratio,
 					inc:   true,
 				}
+				return false
 			}
-			return atomic.LoadInt32(interrupt) == commitInterruptNewHead
+			return true
 		}
 		// If we don't have enough gas for any further transactions then we're done
 		if w.current.gasPool.Gas() < params.TxGas {
