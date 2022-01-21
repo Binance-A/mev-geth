@@ -258,7 +258,7 @@ type TxPool struct {
 	beats              map[common.Address]time.Time // Last heartbeat from each known account
 	mevBundles         []types.MevBundle
 	megabundles        map[common.Address]types.MevBundle // One megabundle per each trusted relay
-	NewMegabundleHooks []func()
+	NewMegabundleHooks []func(*types.MevBundle)
 	all                *txLookup     // All transactions to allow lookups
 	priced             *txPricedList // All transactions sorted by price
 
@@ -631,7 +631,7 @@ func (pool *TxPool) AddMegabundle(relayAddr common.Address, txs types.Transactio
 		return errors.New("megabundle from non-trusted address")
 	}
 
-	pool.megabundles[relayAddr] = types.MevBundle{
+	megabundle := types.MevBundle{
 		Txs:               txs,
 		BlockNumber:       blockNumber,
 		MinTimestamp:      minTimestamp,
@@ -639,8 +639,10 @@ func (pool *TxPool) AddMegabundle(relayAddr common.Address, txs types.Transactio
 		RevertingTxHashes: revertingTxHashes,
 	}
 
+	pool.megabundles[relayAddr] = megabundle
+
 	for hook := range pool.NewMegabundleHooks {
-		go pool.NewMegabundleHooks[hook]()
+		go pool.NewMegabundleHooks[hook](&megabundle)
 	}
 
 	return nil

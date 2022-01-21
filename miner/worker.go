@@ -156,9 +156,12 @@ type worker struct {
 	resultCh           chan *types.Block
 	startCh            chan struct{}
 	exitCh             chan struct{}
-	newMegabundleCh    chan bool
 	resubmitIntervalCh chan time.Duration
 	resubmitAdjustCh   chan *intervalAdjust
+
+	newMegabundleCh               chan *types.MevBundle
+	megabundleCacheMu             sync.Mutex
+	previouslyProcessedMegabundle types.MevBundle
 
 	wg sync.WaitGroup
 
@@ -247,16 +250,16 @@ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus
 		resultCh:           make(chan *types.Block, resultQueueSize),
 		exitCh:             exitCh,
 		startCh:            make(chan struct{}, 1),
-		newMegabundleCh:    make(chan bool),
+		newMegabundleCh:    make(chan *types.MevBundle),
 		resubmitIntervalCh: make(chan time.Duration),
 		resubmitAdjustCh:   make(chan *intervalAdjust, resubmitAdjustChanSize),
 		flashbots:          flashbots,
 	}
 
 	if flashbots.isMegabundleWorker {
-		eth.TxPool().NewMegabundleHooks = append(eth.TxPool().NewMegabundleHooks, func() {
+		eth.TxPool().NewMegabundleHooks = append(eth.TxPool().NewMegabundleHooks, func(megabundle *types.MevBundle) {
 			select {
-			case worker.newMegabundleCh <- true:
+			case worker.newMegabundleCh <- megabundle:
 			default:
 			}
 		})
@@ -354,6 +357,14 @@ func (w *worker) pendingBlockAndReceipts() (*types.Block, types.Receipts) {
 	return w.snapshotBlock, w.snapshotReceipts
 }
 
+func (w *worker) getAndCacheMegabundle(blockNumber *big.Int, blockTime uint64) (types.MevBundle, error) {
+	w.megabundleCacheMu.Lock()
+	megabundle, err := w.eth.TxPool().GetMegabundle(w.flashbots.relayAddr, blockNumber, blockTime)
+	w.previouslyProcessedMegabundle = megabundle
+	w.megabundleCacheMu.Unlock()
+	return megabundle, err
+}
+
 // start sets the running status as 1 and triggers new work submitting.
 func (w *worker) start() {
 	atomic.StoreInt32(&w.running, 1)
@@ -404,9 +415,10 @@ func recalcRecommit(minRecommit, prev time.Duration, target float64, inc bool) t
 func (w *worker) newWorkLoop(recommit time.Duration) {
 	defer w.wg.Done()
 	var (
-		interrupt   *int32
-		minRecommit = recommit // minimal resubmit interval specified by user.
-		timestamp   int64      // timestamp for each round of mining.
+		interrupt           *int32
+		minRecommit         = recommit       // minimal resubmit interval specified by user.
+		timestamp           int64            // timestamp for each round of mining.
+		scheduledMegabundle *types.MevBundle = nil
 	)
 
 	timer := time.NewTimer(0)
@@ -450,9 +462,16 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 			timestamp = time.Now().Unix()
 			commit(false, commitInterruptNewHead)
 
-		case <-w.newMegabundleCh:
+		case megabundle := <-w.newMegabundleCh:
 			if w.isRunning() {
-				commit(true, commitInterruptNewMegabundle)
+				w.megabundleCacheMu.Lock()
+				// Do not interrupt if already processing the same megabundle, but not if megabundle wasn't pulled yet. This can happen if two updates happen in quick succession.
+
+				if (scheduledMegabundle == nil || scheduledMegabundle.Equals(&w.previouslyProcessedMegabundle)) && !megabundle.Equals(&w.previouslyProcessedMegabundle) {
+					scheduledMegabundle = megabundle
+					commit(true, commitInterruptNewMegabundle)
+				}
+				w.megabundleCacheMu.Unlock()
 			}
 
 		case <-timer.C:
@@ -1238,11 +1257,12 @@ func (w *worker) commitNewWork(interrupt *int32, noempty bool, timestamp int64) 
 		w.current.profit.Add(w.current.profit, bundle.ethSentToCoinbase)
 	}
 	if w.flashbots.isMegabundleWorker {
-		megabundle, err := w.eth.TxPool().GetMegabundle(w.flashbots.relayAddr, header.Number, header.Time)
+		megabundle, err := w.getAndCacheMegabundle(header.Number, header.Time)
 		log.Info("Starting to process a Megabundle", "relay", w.flashbots.relayAddr, "megabundle", megabundle, "error", err)
 		if err != nil {
 			return // no valid megabundle for this relay, nothing to do
 		}
+
 		// Flashbots bundle merging duplicates work by simulating TXes and then committing them once more.
 		// Megabundles API focuses on speed and runs everything in one cycle.
 		coinbaseBalanceBefore := w.current.state.GetBalance(w.coinbase)
