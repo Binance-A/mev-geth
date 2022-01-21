@@ -645,7 +645,7 @@ type MevBundle struct {
 }
 
 func (b1 *MevBundle) Equals(b2 *MevBundle) bool {
-	if b1.BlockNumber.Cmp(b2.BlockNumber) != 0 || b1.MinTimestamp != b2.MinTimestamp || b1.MaxTimestamp != b2.MaxTimestamp {
+	if b1.BlockNumber == nil || b2.BlockNumber == nil || b1.BlockNumber.Cmp(b2.BlockNumber) != 0 || b1.MinTimestamp != b2.MinTimestamp || b1.MaxTimestamp != b2.MaxTimestamp {
 		return false
 	}
 

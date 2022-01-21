@@ -359,9 +359,9 @@ func (w *worker) pendingBlockAndReceipts() (*types.Block, types.Receipts) {
 
 func (w *worker) getAndCacheMegabundle(blockNumber *big.Int, blockTime uint64) (types.MevBundle, error) {
 	w.megabundleCacheMu.Lock()
+	defer w.megabundleCacheMu.Unlock()
 	megabundle, err := w.eth.TxPool().GetMegabundle(w.flashbots.relayAddr, blockNumber, blockTime)
 	w.previouslyProcessedMegabundle = megabundle
-	w.megabundleCacheMu.Unlock()
 	return megabundle, err
 }
 
@@ -466,11 +466,17 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 			if w.isRunning() {
 				w.megabundleCacheMu.Lock()
 				// Do not interrupt if already processing the pushed megabundle, or if megabundle wasn't pulled yet (as the most recent will be). This can happen if two updates happen in quick succession.
-				if (scheduledMegabundle == nil || scheduledMegabundle.Equals(&w.previouslyProcessedMegabundle)) && !megabundle.Equals(&w.previouslyProcessedMegabundle) {
-					scheduledMegabundle = megabundle
+				previousMegabundleConsumed := scheduledMegabundle == nil || len(w.previouslyProcessedMegabundle.Txs) == 0 || scheduledMegabundle.Equals(&w.previouslyProcessedMegabundle)
+				currentMegabundleConsumed := megabundle.Equals(&w.previouslyProcessedMegabundle)
+
+				shouldInterrupt := previousMegabundleConsumed && !currentMegabundleConsumed
+
+				scheduledMegabundle = megabundle
+				w.megabundleCacheMu.Unlock()
+
+				if shouldInterrupt {
 					commit(true, commitInterruptNewMegabundle)
 				}
-				w.megabundleCacheMu.Unlock()
 			}
 
 		case <-timer.C:
